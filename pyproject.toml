@@ -1,0 +1,16 @@
+[project]
+name = "comfyui-datadog-monitor"
+description = ""
+version = "1.0.0"
+license = {file = "LICENSE"}
+dependencies = ["# Datadog memory profiling", "ddtrace>=2.0.0", "# System monitoring", "psutil>=5.9.0"]
+
+[project.urls]
+Repository = "https://github.com/ric-yu/comfyui-datadog-monitor"
+#  Used by Comfy Registry https://registry.comfy.org
+
+[tool.comfy]
+PublisherId = "ric-yu"
+DisplayName = "comfyui-datadog-monitor"
+Icon = ""
+includes = []
