@@ -42,10 +42,8 @@ def _configure_ddtrace():
 # Configure on module import
 _configured = _configure_ddtrace()
 
-# Import the node (optional - for manual use)
-try:
-    from .datadog_memory_profiler import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
-except ImportError:
-    from datadog_memory_profiler import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
+# No UI nodes - this is a background-only extension
+NODE_CLASS_MAPPINGS = {}
+NODE_DISPLAY_NAME_MAPPINGS = {}
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]

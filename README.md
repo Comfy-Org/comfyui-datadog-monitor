@@ -1,6 +1,6 @@
 # ComfyUI Datadog Monitor
 
-Minimal custom node that enables comprehensive Datadog APM tracing and profiling for ComfyUI.
+Background extension that automatically enables comprehensive Datadog APM tracing and profiling for ComfyUI. No UI nodes - runs entirely in the background.
 
 ## Features
 
@@ -8,7 +8,8 @@ Minimal custom node that enables comprehensive Datadog APM tracing and profiling
 - **Memory Profiling**: Heap allocation tracking and memory growth detection
 - **CPU Profiling**: Function-level CPU usage and hot path identification
 - **Distributed Tracing**: Automatic trace correlation across all operations
-- **Zero Configuration**: Works automatically when installed - no workflow changes needed
+- **Zero Configuration**: Works automatically when installed - no nodes to add
+- **Background Only**: No UI nodes, runs entirely in the background
 
 ## What Gets Traced
 
@@ -43,10 +44,12 @@ export DD_AGENT_HOST=localhost  # Your Datadog agent host
 
 ## How It Works
 
-The node uses `ddtrace.auto` which must be imported before any other imports. When ComfyUI loads this custom node, it:
+This extension uses `ddtrace.auto` which must be imported before any other imports. When ComfyUI loads this extension, it:
 1. Imports `ddtrace.auto` to enable full instrumentation
 2. Configures service tags for proper APM organization
 3. Starts continuous profiling in the background
+
+No nodes appear in the UI - everything runs automatically in the background.
 
 ## Memory Monitoring
 
@@ -56,22 +59,6 @@ While the DDTrace profiler handles detailed memory profiling, the Go sidecar han
 - Automatic restart on OOM
 - Job failure tracking
 
-## Optional Node Usage
-
-While profiling works automatically, you can optionally add the "Datadog Memory Profiler" node to workflows as a pass-through to see current memory usage:
-
-- **Input**: Any data (pass-through)
-- **Output 1**: Same data (unchanged) 
-- **Output 2**: JSON with current memory info
-
-```json
-{
-  "rss_gb": 12.5,
-  "vms_gb": 18.3,
-  "percent": 17.8,
-  "ddtrace": "auto-instrumented"
-}
-```
 
 ## Environment Variables
 
