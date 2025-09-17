@@ -20,7 +20,12 @@ def _configure_ddtrace():
     """Configure DDTrace settings"""
     try:
         from ddtrace import config, tracer
-        
+
+        # CRITICAL: Start the writer service if it's stopped
+        if tracer._writer.status.name == 'STOPPED':
+            tracer._writer.start()
+            print("🚀 DDTrace writer started")
+
         # Set service info if not already set by environment
         if not os.getenv('DD_SERVICE'):
             tracer.set_tags({
@@ -28,12 +33,12 @@ def _configure_ddtrace():
                 'env': os.getenv('DD_ENV', 'production'),
                 'version': os.getenv('DD_VERSION', '1.0.0')
             })
-        
+
         # Enable additional features via config
         # These may already be set by environment variables
         config.analytics_enabled = True  # APM analytics
-        
-        print("📊 DDTrace configuration applied")
+
+        print(f"📊 DDTrace configuration applied (writer: {tracer._writer.status.name})")
         return True
     except Exception as e:
         print(f"⚠️ Could not configure DDTrace: {e}")
