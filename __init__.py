@@ -1,78 +1,202 @@
 """
-ComfyUI Datadog APM Tracer and Profiler
-Automatically instruments ComfyUI with comprehensive APM tracing and profiling.
-No UI nodes - runs entirely in the background via monkey patching.
+ComfyUI PyTorch Memory Tracker
+Tracks PyTorch CUDA memory allocations for OOM debugging.
+Controlled via PYTORCH_MEMORY_TRACKING environment variable.
 """
 
 import os
-import sys
-import time
-import psutil
 import functools
-import threading
-from typing import Any, Dict, Optional
 import logging
 
-# MUST be imported as the very first thing for full instrumentation
+# Import tracer for DataDog APM integration
 try:
-    import ddtrace.auto  # This enables ALL ddtrace features
-    print("✅ DDTrace auto-instrumentation enabled (full tracing, profiling, ASM)")
+    from ddtrace import tracer, config
+    from ddtrace.runtime import RuntimeMetrics
+    RuntimeMetrics.enable()
     DDTRACE_AVAILABLE = True
 except ImportError:
     print("⚠️ DDTrace not available - install with: pip install ddtrace")
     DDTRACE_AVAILABLE = False
-except Exception as e:
-    print(f"⚠️ Could not enable DDTrace auto-instrumentation: {e}")
-    DDTRACE_AVAILABLE = False
-
-# Import tracer for manual instrumentation
-if DDTRACE_AVAILABLE:
-    from ddtrace import tracer, patch_all, config
-    from ddtrace.runtime import RuntimeMetrics
-    from ddtrace.profiling import Profiler
-
-    # Enable runtime metrics collection (includes memory metrics)
-    RuntimeMetrics.enable()
-
-    # Enable memory and heap profiling via environment variables
-    os.environ.setdefault('DD_PROFILING_MEMORY_ENABLED', 'true')
-    os.environ.setdefault('DD_PROFILING_HEAP_ENABLED', 'true')
-
-    # Enable profiling for detailed memory analysis
-    try:
-        profiler = Profiler(
-            env=os.getenv('DD_ENV', 'production'),
-            service=os.getenv('DD_SERVICE', 'comfyui'),
-            version=os.getenv('DD_VERSION', '1.0.0'),
-            tags={
-                'component': 'comfyui',
-                'profiler': 'ddtrace',
-            }
-        )
-        profiler.start()
-
-        # Log profiling configuration
-        mem_enabled = os.getenv('DD_PROFILING_MEMORY_ENABLED', 'false').lower() == 'true'
-        heap_enabled = os.getenv('DD_PROFILING_HEAP_ENABLED', 'false').lower() == 'true'
-        print(f"🔬 DDTrace Profiler started (Memory: {mem_enabled}, Heap: {heap_enabled})")
-    except Exception as e:
-        print(f"⚠️ Could not start profiler: {e}")
-
-    # Patch all available integrations
-    patch_all()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Global state tracking
+# PyTorch Memory Tracking Configuration
+PYTORCH_MEMORY_TRACKING_ENABLED = os.getenv('PYTORCH_MEMORY_TRACKING', '').lower() == 'true'
+
+if PYTORCH_MEMORY_TRACKING_ENABLED:
+    print("🧠 PyTorch memory tracking enabled")
+
+def enable_pytorch_memory_tracking():
+    """Enable PyTorch's native memory tracking"""
+    if not PYTORCH_MEMORY_TRACKING_ENABLED:
+        return False
+
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.memory._record_memory_history(enabled=True)
+            print("🧠 PyTorch CUDA memory history tracking enabled")
+            return True
+        elif torch.backends.mps.is_available():
+            print("🧠 PyTorch MPS device detected - basic memory tracking available")
+            return True
+    except Exception as e:
+        logger.debug(f"Could not enable PyTorch memory tracking: {e}")
+    return False
+
+def capture_pytorch_memory_snapshot(span, stage=""):
+    """Capture PyTorch memory stats and send to DataDog"""
+    if not PYTORCH_MEMORY_TRACKING_ENABLED:
+        return
+
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            stats = torch.cuda.memory_stats()
+            for key, value in {
+                f'pytorch.{stage}.allocated_bytes': stats.get('allocated_bytes.all.current', 0),
+                f'pytorch.{stage}.reserved_bytes': stats.get('reserved_bytes.all.current', 0),
+                f'pytorch.{stage}.num_ooms': stats.get('num_ooms', 0),
+            }.items():
+                span.set_metric(key, value)
+
+            if stage == "after" and stats.get('num_ooms', 0) > 0:
+                summary = torch.cuda.memory_summary()
+                logger.info(f"PyTorch CUDA Memory Summary:\n{summary.split(chr(10))[:10]}")
+
+        elif torch.backends.mps.is_available():
+            allocated = torch.mps.current_allocated_memory()
+            driver_allocated = torch.mps.driver_allocated_memory()
+            span.set_metric(f'pytorch.{stage}.mps_allocated_bytes', allocated)
+            span.set_metric(f'pytorch.{stage}.mps_driver_allocated_bytes', driver_allocated)
+
+    except Exception as e:
+        logger.error(f"Could not capture PyTorch memory snapshot: {e}")
+
+def log_top_memory_allocations(span, prompt_id, stage="after", top_n=5):
+    """Extract and log top N memory allocations from PyTorch (CUDA VRAM + CPU RAM)"""
+    if not PYTORCH_MEMORY_TRACKING_ENABLED:
+        return
+
+    try:
+        import torch
+        import gc
+        import traceback as tb
+
+        # Track CUDA (VRAM) allocations with stack traces
+        cuda_allocations = []
+        if torch.cuda.is_available():
+            snapshot = torch.cuda.memory._snapshot()
+            if snapshot and 'segments' in snapshot:
+                for segment in snapshot.get('segments', []):
+                    for block in segment.get('blocks', []):
+                        if block.get('state') == 'active_allocated':
+                            size_bytes = block.get('size', 0)
+                            frames = block.get('frames', [])
+
+                            stack_trace = []
+                            for frame in frames[:5]:
+                                filename = frame.get('filename', 'unknown')
+                                line = frame.get('line', 0)
+                                name = frame.get('name', 'unknown')
+                                # Shorten paths
+                                if 'site-packages' in filename:
+                                    filename = '...' + filename.split('site-packages')[-1]
+                                elif 'comfyui' in filename.lower():
+                                    filename = '...' + filename.split('comfyui')[-1]
+                                stack_trace.append(f"{filename}:{line} in {name}")
+
+                            cuda_allocations.append({
+                                'size_mb': size_bytes / 1024 / 1024,
+                                'size_bytes': size_bytes,
+                                'location': 'cuda',
+                                'stack_trace': stack_trace
+                            })
+
+        # Track CPU (RAM) tensor allocations
+        cpu_allocations = []
+        gc.collect()  # Ensure we're looking at current state
+        for obj in gc.get_objects():
+            try:
+                if torch.is_tensor(obj):
+                    # Only track CPU tensors (RAM, not VRAM)
+                    if not obj.is_cuda and not (hasattr(obj, 'is_mps') and obj.is_mps):
+                        size_bytes = obj.element_size() * obj.nelement()
+
+                        # Get type info
+                        dtype = str(obj.dtype).replace('torch.', '')
+                        shape = 'x'.join(map(str, obj.shape)) if obj.shape else 'scalar'
+
+                        cpu_allocations.append({
+                            'size_mb': size_bytes / 1024 / 1024,
+                            'size_bytes': size_bytes,
+                            'location': 'cpu',
+                            'dtype': dtype,
+                            'shape': shape,
+                            'stack_trace': [f"tensor({dtype}, shape={shape})"]
+                        })
+            except Exception:
+                continue
+
+        # Combine and sort all allocations
+        all_allocations = cuda_allocations + cpu_allocations
+        if not all_allocations:
+            return
+
+        top_allocations = sorted(all_allocations, key=lambda x: x['size_bytes'], reverse=True)[:top_n]
+
+        # Calculate totals by location
+        total_cuda = sum(a['size_bytes'] for a in cuda_allocations) / 1024 / 1024
+        total_cpu = sum(a['size_bytes'] for a in cpu_allocations) / 1024 / 1024
+        total_all = total_cuda + total_cpu
+
+        # Log summary
+        logger.info(f"🔍 Top {top_n} PyTorch allocations (CUDA: {total_cuda:.1f} MB, CPU: {total_cpu:.1f} MB, Total: {total_all:.1f} MB):")
+        for i, alloc in enumerate(top_allocations, 1):
+            location = alloc['location'].upper()
+            logger.info(f"  #{i} [{location}]: {alloc['size_mb']:.1f} MB")
+            for frame in alloc['stack_trace'][:3]:
+                logger.info(f"      {frame}")
+
+        # Tag DataDog span
+        if span:
+            span.set_metric(f'pytorch.{stage}.num_allocations', len(all_allocations))
+            span.set_metric(f'pytorch.{stage}.num_cpu_tensors', len(cpu_allocations))
+            span.set_metric(f'pytorch.{stage}.num_cuda_tensors', len(cuda_allocations))
+            span.set_metric(f'pytorch.{stage}.total_allocated_mb', total_all)
+            span.set_metric(f'pytorch.{stage}.cpu_allocated_mb', total_cpu)
+            span.set_metric(f'pytorch.{stage}.cuda_allocated_mb', total_cuda)
+
+            if top_allocations:
+                largest = top_allocations[0]
+                span.set_metric(f'pytorch.{stage}.largest_allocation_mb', largest['size_mb'])
+                span.set_tag(f'pytorch.{stage}.largest_allocation_location', largest['location'])
+                if largest['stack_trace']:
+                    span.set_tag(f'pytorch.{stage}.largest_allocation_info', largest['stack_trace'][0])
+
+        # Log structured summary
+        summary_parts = [
+            f"prompt_id={prompt_id}",
+            f"stage={stage}",
+            f"cpu={total_cpu:.1f}MB",
+            f"cuda={total_cuda:.1f}MB",
+            f"total={total_all:.1f}MB"
+        ]
+        for i, alloc in enumerate(top_allocations, 1):
+            loc = alloc['location']
+            info = alloc['stack_trace'][0] if alloc['stack_trace'] else 'unknown'
+            summary_parts.append(f"top{i}={loc}:{alloc['size_mb']:.1f}MB:{info}")
+
+        logger.info(f"pytorch_memory_allocations: {' '.join(summary_parts)}")
+
+    except Exception as e:
+        logger.error(f"Could not log top memory allocations: {e}")
+
+# Global state
 _patched = False
-_execution_stats = {
-    'workflows_executed': 0,
-    'nodes_executed': 0,
-    'total_execution_time': 0.0,
-    'errors_tracked': 0
-}
 
 def _configure_ddtrace():
     """Configure DDTrace settings"""
@@ -80,185 +204,36 @@ def _configure_ddtrace():
         return False
 
     try:
-        # CRITICAL: Start the writer service if it's stopped
         if hasattr(tracer, '_writer') and tracer._writer.status.name == 'STOPPED':
             tracer._writer.start()
-            print("🚀 DDTrace writer started")
 
-        # Set service info if not already set by environment
         service = os.getenv('DD_SERVICE', 'comfyui')
         env = os.getenv('DD_ENV', 'production')
-        version = os.getenv('DD_VERSION', '1.0.0')
 
-        tracer.set_tags({
-            'service': service,
-            'env': env,
-            'version': version
-        })
+        tracer.set_tags({'service': service, 'env': env})
+        config.analytics_enabled = True
 
-        # Enable additional features via config
-        config.analytics_enabled = True  # APM analytics
-
-        # Log configuration
-        agent_url = getattr(tracer._writer, 'agent_url', 'unknown') if hasattr(tracer, '_writer') else 'unknown'
-        print(f"📊 DDTrace configuration applied")
-        print(f"   Service: {service}, Env: {env}, Version: {version}")
-        print(f"   Agent URL: {agent_url}")
-        print(f"   Writer Status: {tracer._writer.status.name if hasattr(tracer, '_writer') else 'unknown'}")
-
+        print(f"📊 DDTrace configured: {service} ({env})")
         return True
     except Exception as e:
         print(f"⚠️ Could not configure DDTrace: {e}")
         return False
 
 def monkey_patch_comfyui():
-    """Monkey patch ComfyUI execution to add comprehensive tracing"""
+    """Patch ComfyUI workflow execution to add PyTorch memory tracking"""
     global _patched
 
     if _patched:
-        logger.info("ComfyUI already instrumented, skipping")
         return
 
     if not DDTRACE_AVAILABLE:
-        logger.info("DDTrace not available, skipping ComfyUI instrumentation")
+        logger.info("DDTrace not available, skipping instrumentation")
         return
 
     try:
-        # Import execution module
         import execution
 
-        print("🔧 Instrumenting ComfyUI execution...")
-
-        # Patch node execution
-        if hasattr(execution, 'execute'):
-            original_execute = execution.execute
-
-            @functools.wraps(original_execute)
-            async def traced_execute(server, dynprompt, caches, current_item, extra_data, executed, prompt_id, execution_list, pending_subgraph_results, pending_async_nodes):
-                """Traced version of ComfyUI node execution"""
-                global _execution_stats
-
-                unique_id = current_item
-
-                # Get node information safely
-                try:
-                    real_node_id = dynprompt.get_real_node_id(unique_id)
-                    display_node_id = dynprompt.get_display_node_id(unique_id)
-                    node_data = dynprompt.get_node(unique_id)
-                    class_type = node_data.get('class_type', 'unknown')
-                except:
-                    real_node_id = unique_id
-                    display_node_id = unique_id
-                    class_type = 'unknown'
-
-                # Create span for this node execution
-                span_name = f"comfyui.node.execute"
-                with tracer.trace(
-                    span_name,
-                    service="comfyui",
-                    resource=f"{class_type}#{display_node_id}"
-                ) as span:
-                    # Add node metadata
-                    span.set_tags({
-                        'node.id': unique_id,
-                        'node.display_id': display_node_id,
-                        'node.real_id': real_node_id,
-                        'node.class_type': class_type,
-                        'prompt.id': prompt_id,
-                        'job.id': extra_data.get('job_id') if extra_data else None,
-                        'client.id': extra_data.get('client_id') if extra_data else None,
-                    })
-
-                    # Track comprehensive memory metrics before execution
-                    process = psutil.Process()
-                    mem_info_before = process.memory_info()
-                    mem_before = mem_info_before.rss / 1024 / 1024  # MB
-                    vms_before = mem_info_before.vms / 1024 / 1024  # Virtual memory
-
-                    # Track system memory availability
-                    sys_mem = psutil.virtual_memory()
-                    sys_available_before = sys_mem.available / 1024 / 1024  # MB
-                    sys_percent_before = sys_mem.percent
-
-                    cpu_percent_before = process.cpu_percent(interval=0)
-
-                    # Execute the node
-                    start_time = time.time()
-                    try:
-                        result = await original_execute(
-                            server, dynprompt, caches, current_item, extra_data,
-                            executed, prompt_id, execution_list,
-                            pending_subgraph_results, pending_async_nodes
-                        )
-
-                        # Track success
-                        span.set_tag('node.status', 'success')
-                        _execution_stats['nodes_executed'] += 1
-
-                        return result
-
-                    except Exception as e:
-                        # Track error
-                        span.set_tag('node.status', 'error')
-                        span.set_tag('error', True)
-                        span.set_tag('error.type', type(e).__name__)
-                        span.set_tag('error.message', str(e))
-                        _execution_stats['errors_tracked'] += 1
-                        raise
-
-                    finally:
-                        # Track comprehensive memory and execution metrics
-                        execution_time = time.time() - start_time
-                        mem_info_after = process.memory_info()
-                        mem_after = mem_info_after.rss / 1024 / 1024  # MB
-                        vms_after = mem_info_after.vms / 1024 / 1024  # Virtual memory
-
-                        # System memory after
-                        sys_mem_after = psutil.virtual_memory()
-                        sys_available_after = sys_mem_after.available / 1024 / 1024
-                        sys_percent_after = sys_mem_after.percent
-
-                        cpu_percent_after = process.cpu_percent(interval=0)
-
-                        span.set_metrics({
-                            'node.execution_time_seconds': execution_time,
-                            # Process memory metrics
-                            'node.memory_rss_before_mb': mem_before,
-                            'node.memory_rss_after_mb': mem_after,
-                            'node.memory_rss_delta_mb': mem_after - mem_before,
-                            'node.memory_vms_before_mb': vms_before,
-                            'node.memory_vms_after_mb': vms_after,
-                            'node.memory_vms_delta_mb': vms_after - vms_before,
-                            # System memory metrics
-                            'system.memory_available_before_mb': sys_available_before,
-                            'system.memory_available_after_mb': sys_available_after,
-                            'system.memory_available_delta_mb': sys_available_after - sys_available_before,
-                            'system.memory_percent_before': sys_percent_before,
-                            'system.memory_percent_after': sys_percent_after,
-                            # CPU metrics
-                            'node.cpu_percent': cpu_percent_after,
-                        })
-
-                        # Track GPU if available
-                        try:
-                            import torch
-                            if torch.cuda.is_available():
-                                gpu_memory = torch.cuda.memory_allocated() / 1024 / 1024  # MB
-                                gpu_reserved = torch.cuda.memory_reserved() / 1024 / 1024  # MB
-                                span.set_metrics({
-                                    'node.gpu_memory_allocated_mb': gpu_memory,
-                                    'node.gpu_memory_reserved_mb': gpu_reserved,
-                                })
-                                if torch.cuda.device_count() > 0:
-                                    span.set_tag('gpu.device_name', torch.cuda.get_device_name(0))
-                        except:
-                            pass
-
-                        _execution_stats['total_execution_time'] += execution_time
-
-            # Replace the original function
-            execution.execute = traced_execute
-            print("   ✅ Node execution instrumented")
+        print("🔧 Instrumenting ComfyUI for PyTorch memory tracking...")
 
         # Patch workflow execution
         if hasattr(execution, 'PromptExecutor'):
@@ -269,186 +244,53 @@ def monkey_patch_comfyui():
 
                 @functools.wraps(original_execute_async)
                 async def traced_execute_async(self, prompt, prompt_id, extra_data={}, execute_outputs=[]):
-                    """Traced version of workflow execution"""
-                    global _execution_stats
-
-                    # Create main workflow span
+                    """Traced version of workflow execution with PyTorch memory tracking"""
                     with tracer.trace(
                         "comfyui.workflow.execute",
                         service="comfyui",
                         resource=f"workflow#{prompt_id}"
                     ) as span:
-                        # Add workflow metadata
                         job_id = extra_data.get('job_id') if extra_data else None
-                        client_id = extra_data.get('client_id') if extra_data else None
 
                         span.set_tags({
                             'workflow.prompt_id': prompt_id,
-                            'workflow.client_id': client_id,
                             'job.id': job_id,
-                            'workflow.node_count': len(prompt) if prompt else 0,
                         })
 
-                        # Track comprehensive workflow execution metrics
-                        start_time = time.time()
-                        process = psutil.Process()
-                        mem_info_before = process.memory_info()
-                        mem_before = mem_info_before.rss / 1024 / 1024  # MB
-                        vms_before = mem_info_before.vms / 1024 / 1024  # Virtual memory
-
-                        # Track system memory availability
-                        sys_mem = psutil.virtual_memory()
-                        sys_available_before = sys_mem.available / 1024 / 1024  # MB
-                        sys_percent_before = sys_mem.percent
-
-                        cpu_percent_before = process.cpu_percent(interval=0)
+                        # Capture PyTorch memory before workflow
+                        capture_pytorch_memory_snapshot(span, "before")
 
                         try:
                             result = await original_execute_async(self, prompt, prompt_id, extra_data, execute_outputs)
-                            span.set_tag('workflow.status', 'success')
-                            _execution_stats['workflows_executed'] += 1
+
+                            # Capture PyTorch memory after workflow
+                            capture_pytorch_memory_snapshot(span, "after")
+
+                            # Log top memory allocations with stack traces
+                            log_top_memory_allocations(span, prompt_id, stage="after", top_n=5)
+
                             return result
 
                         except Exception as e:
-                            span.set_tag('workflow.status', 'error')
                             span.set_tag('error', True)
                             span.set_tag('error.type', type(e).__name__)
-                            span.set_tag('error.message', str(e))
-                            _execution_stats['errors_tracked'] += 1
                             raise
 
-                        finally:
-                            # Track comprehensive workflow metrics
-                            execution_time = time.time() - start_time
-                            mem_info_after = process.memory_info()
-                            mem_after = mem_info_after.rss / 1024 / 1024  # MB
-                            vms_after = mem_info_after.vms / 1024 / 1024  # Virtual memory
-
-                            # System memory after
-                            sys_mem_after = psutil.virtual_memory()
-                            sys_available_after = sys_mem_after.available / 1024 / 1024
-                            sys_percent_after = sys_mem_after.percent
-
-                            cpu_percent_after = process.cpu_percent(interval=0)
-
-                            span.set_metrics({
-                                'workflow.execution_time_seconds': execution_time,
-                                # Process memory metrics
-                                'workflow.memory_rss_before_mb': mem_before,
-                                'workflow.memory_rss_after_mb': mem_after,
-                                'workflow.memory_rss_delta_mb': mem_after - mem_before,
-                                'workflow.memory_vms_before_mb': vms_before,
-                                'workflow.memory_vms_after_mb': vms_after,
-                                'workflow.memory_vms_delta_mb': vms_after - vms_before,
-                                # System memory metrics
-                                'system.memory_available_before_mb': sys_available_before,
-                                'system.memory_available_after_mb': sys_available_after,
-                                'system.memory_available_delta_mb': sys_available_after - sys_available_before,
-                                'system.memory_percent_before': sys_percent_before,
-                                'system.memory_percent_after': sys_percent_after,
-                                # CPU metrics
-                                'workflow.cpu_percent': cpu_percent_after,
-                            })
-
-                            # Track GPU for workflow
-                            try:
-                                import torch
-                                if torch.cuda.is_available():
-                                    span.set_metrics({
-                                        'workflow.gpu_memory_allocated_mb': torch.cuda.memory_allocated() / 1024 / 1024,
-                                        'workflow.gpu_memory_reserved_mb': torch.cuda.memory_reserved() / 1024 / 1024,
-                                    })
-                            except:
-                                pass
-
-                            _execution_stats['total_execution_time'] += execution_time
-
-                # Replace the method
                 PromptExecutor.execute_async = traced_execute_async
-                print("   ✅ Workflow execution instrumented")
-
-        # Also instrument model loading if available
-        try:
-            import comfy.model_management as model_management
-
-            if hasattr(model_management, 'load_models_gpu'):
-                original_load_models = model_management.load_models_gpu
-
-                @functools.wraps(original_load_models)
-                def traced_load_models(*args, **kwargs):
-                    """Trace model loading operations"""
-                    with tracer.trace(
-                        "comfyui.model.load",
-                        service="comfyui",
-                        resource="load_models_gpu"
-                    ) as span:
-                        # Track model info if available
-                        if args and hasattr(args[0], '__len__'):
-                            span.set_tag('model.count', len(args[0]))
-
-                        process = psutil.Process()
-                        mem_before = process.memory_info().rss / 1024 / 1024
-
-                        start_time = time.time()
-                        try:
-                            result = original_load_models(*args, **kwargs)
-                            span.set_tag('model.load.status', 'success')
-                            return result
-                        except Exception as e:
-                            span.set_tag('model.load.status', 'error')
-                            span.set_tag('error', True)
-                            span.set_tag('error.type', type(e).__name__)
-                            raise
-                        finally:
-                            execution_time = time.time() - start_time
-                            mem_after = process.memory_info().rss / 1024 / 1024
-
-                            span.set_metrics({
-                                'model.load.time_seconds': execution_time,
-                                'model.load.memory_delta_mb': mem_after - mem_before,
-                            })
-
-                            # Track GPU memory after model load
-                            try:
-                                import torch
-                                if torch.cuda.is_available():
-                                    span.set_metrics({
-                                        'model.gpu_memory_after_mb': torch.cuda.memory_allocated() / 1024 / 1024,
-                                    })
-                            except:
-                                pass
-
-                model_management.load_models_gpu = traced_load_models
-                print("   ✅ Model loading instrumented")
-        except Exception as e:
-            logger.debug(f"Could not instrument model loading: {e}")
+                print("   ✅ Workflow execution instrumented for PyTorch memory tracking")
 
         _patched = True
-        print("🎉 ComfyUI fully instrumented with DDTrace APM!")
-
-        # Log stats periodically
-        def log_stats():
-            while True:
-                time.sleep(60)  # Log every minute
-                if _execution_stats['workflows_executed'] > 0:
-                    logger.info(f"APM Stats: Workflows={_execution_stats['workflows_executed']}, "
-                               f"Nodes={_execution_stats['nodes_executed']}, "
-                               f"Total Time={_execution_stats['total_execution_time']:.2f}s, "
-                               f"Errors={_execution_stats['errors_tracked']}")
-
-        stats_thread = threading.Thread(target=log_stats, daemon=True)
-        stats_thread.start()
+        print("🎉 ComfyUI PyTorch memory tracking enabled!")
 
     except ImportError as e:
         logger.warning(f"Could not import execution module: {e}")
     except Exception as e:
         logger.error(f"Failed to instrument ComfyUI: {e}")
-        import traceback
-        traceback.print_exc()
 
 # Configure and patch on module import
 if DDTRACE_AVAILABLE:
-    _configured = _configure_ddtrace()
+    _configure_ddtrace()
+    enable_pytorch_memory_tracking()
     monkey_patch_comfyui()
 else:
     print("⚠️ Skipping instrumentation - ddtrace not available")
