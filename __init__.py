@@ -57,9 +57,9 @@ def capture_pytorch_memory_snapshot(span, stage=""):
         if torch.cuda.is_available():
             stats = torch.cuda.memory_stats()
             for key, value in {
-                f'pytorch.{stage}.allocated_bytes': stats.get('allocated_bytes.all.current', 0),
-                f'pytorch.{stage}.reserved_bytes': stats.get('reserved_bytes.all.current', 0),
-                f'pytorch.{stage}.num_ooms': stats.get('num_ooms', 0),
+                f'memory.pytorch.allocated_bytes.{stage}': stats.get('allocated_bytes.all.current', 0),
+                f'memory.pytorch.reserved_bytes.{stage}': stats.get('reserved_bytes.all.current', 0),
+                f'memory.pytorch.num_ooms.{stage}': stats.get('num_ooms', 0),
             }.items():
                 span.set_metric(key, value)
 
@@ -70,8 +70,8 @@ def capture_pytorch_memory_snapshot(span, stage=""):
         elif torch.backends.mps.is_available():
             allocated = torch.mps.current_allocated_memory()
             driver_allocated = torch.mps.driver_allocated_memory()
-            span.set_metric(f'pytorch.{stage}.mps_allocated_bytes', allocated)
-            span.set_metric(f'pytorch.{stage}.mps_driver_allocated_bytes', driver_allocated)
+            span.set_metric(f'memory.pytorch.mps_allocated_bytes.{stage}', allocated)
+            span.set_metric(f'memory.pytorch.mps_driver_allocated_bytes.{stage}', driver_allocated)
 
     except Exception as e:
         logger.error(f"Could not capture PyTorch memory snapshot: {e}")
@@ -163,19 +163,23 @@ def log_top_memory_allocations(span, prompt_id, stage="after", top_n=5):
 
         # Tag DataDog span
         if span:
-            span.set_metric(f'pytorch.{stage}.num_allocations', len(all_allocations))
-            span.set_metric(f'pytorch.{stage}.num_cpu_tensors', len(cpu_allocations))
-            span.set_metric(f'pytorch.{stage}.num_cuda_tensors', len(cuda_allocations))
-            span.set_metric(f'pytorch.{stage}.total_allocated_mb', total_all)
-            span.set_metric(f'pytorch.{stage}.cpu_allocated_mb', total_cpu)
-            span.set_metric(f'pytorch.{stage}.cuda_allocated_mb', total_cuda)
+            logger.info(f"✅ Setting PyTorch metrics on span (span_id={getattr(span, 'span_id', 'unknown')})")
+            span.set_metric(f'memory.pytorch.num_allocations.{stage}', len(all_allocations))
+            span.set_metric(f'memory.pytorch.num_cpu_tensors.{stage}', len(cpu_allocations))
+            span.set_metric(f'memory.pytorch.num_cuda_tensors.{stage}', len(cuda_allocations))
+            span.set_metric(f'memory.pytorch.total_mb.{stage}', total_all)
+            span.set_metric(f'memory.pytorch.cpu_mb.{stage}', total_cpu)
+            span.set_metric(f'memory.pytorch.cuda_mb.{stage}', total_cuda)
 
             if top_allocations:
                 largest = top_allocations[0]
-                span.set_metric(f'pytorch.{stage}.largest_allocation_mb', largest['size_mb'])
-                span.set_tag(f'pytorch.{stage}.largest_allocation_location', largest['location'])
+                span.set_metric(f'memory.pytorch.largest_mb.{stage}', largest['size_mb'])
+                span.set_tag(f'memory.pytorch.largest_location.{stage}', largest['location'])
                 if largest['stack_trace']:
-                    span.set_tag(f'pytorch.{stage}.largest_allocation_info', largest['stack_trace'][0])
+                    span.set_tag(f'memory.pytorch.largest_info.{stage}', largest['stack_trace'][0])
+            logger.info(f"✅ PyTorch metrics set successfully")
+        else:
+            logger.warning(f"⚠️ No span provided to log_top_memory_allocations, metrics not tagged")
 
         # Log structured summary
         summary_parts = [
