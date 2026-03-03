@@ -20,10 +20,7 @@ try:
     import ddtrace.auto  # noqa: F401
     from ddtrace import tracer, config
     from ddtrace.runtime import RuntimeMetrics
-    try:
-        from ddtrace.context import Context as DDContext
-    except ImportError:
-        from ddtrace._trace.context import Context as DDContext
+    from ddtrace.trace import Context as DDContext
     RuntimeMetrics.enable()
     DDTRACE_AVAILABLE = True
 except ImportError:
@@ -183,7 +180,6 @@ def _configure_ddtrace():
         env = os.getenv('DD_ENV', 'production')
 
         tracer.set_tags({'service': service, 'env': env})
-        config.analytics_enabled = True
 
         print(f"📊 DDTrace configured: {service} ({env})")
         return True

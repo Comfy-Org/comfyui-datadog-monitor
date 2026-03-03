@@ -8,10 +8,7 @@ between the inference service and ComfyUI.
 import pytest
 from ddtrace import tracer
 
-try:
-    from ddtrace.context import Context as DDContext
-except ImportError:
-    from ddtrace._trace.context import Context as DDContext
+from ddtrace.trace import Context as DDContext
 
 
 class TestTraceContextExtraction:
