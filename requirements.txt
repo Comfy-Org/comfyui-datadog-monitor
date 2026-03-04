@@ -1,5 +1,2 @@
-# Datadog memory profiling
-ddtrace>=2.0.0
-
-# System monitoring
-psutil>=5.9.0
+# Datadog APM tracing
+ddtrace>=4.0.0
