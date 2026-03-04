@@ -7,6 +7,7 @@ Controlled via environment variables (see README).
 
 import os
 import functools
+import inspect
 import logging
 
 
@@ -206,6 +207,27 @@ def log_top_memory_allocations(span, prompt_id, stage="after", top_n=5):
     except Exception as e:
         logger.error(f"Could not log top memory allocations: {e}")
 
+def _extract_param(sig, args, kwargs, name, default=None):
+    """Extract a named parameter from *args/**kwargs using a pre-computed signature.
+
+    Uses inspect.signature binding to resolve positional and keyword arguments
+    by name, regardless of position. Returns `default` if the parameter doesn't
+    exist in the signature or wasn't provided — making wrappers resilient to
+    upstream signature changes.
+
+    Called once per invocation with ~0 overhead (dict lookup, no reflection).
+    The `sig` object should be obtained once at patch time via inspect.signature().
+    """
+    try:
+        bound = sig.bind(*args, **kwargs)
+        bound.apply_defaults()
+        return bound.arguments.get(name, default)
+    except TypeError:
+        # Signature mismatch (e.g. upstream added required params we don't know about).
+        # Fall back gracefully rather than crashing the wrapper.
+        return default
+
+
 # Global state
 _patched = False
 
@@ -253,10 +275,20 @@ def monkey_patch_comfyui():
 
             if hasattr(PromptExecutor, 'execute_async'):
                 original_execute_async = PromptExecutor.execute_async
+                _ea_sig = inspect.signature(original_execute_async)
 
                 @functools.wraps(original_execute_async)
-                async def traced_execute_async(self, prompt, prompt_id, extra_data={}, execute_outputs=[]):
-                    """Traced version of workflow execution with PyTorch memory tracking"""
+                async def traced_execute_async(self, *args, **kwargs):
+                    """Traced version of workflow execution with PyTorch memory tracking.
+
+                    Uses *args/**kwargs to forward all parameters transparently,
+                    making this wrapper resilient to upstream signature changes.
+                    Parameters we need are extracted by name via inspect.signature binding.
+                    """
+                    # Extract the parameters we need by name (position-independent)
+                    prompt_id = _extract_param(_ea_sig, (self, *args), kwargs, 'prompt_id')
+                    extra_data = _extract_param(_ea_sig, (self, *args), kwargs, 'extra_data', {})
+
                     # Activate parent trace context from inference service (if present).
                     # This makes comfyui.workflow.execute a child span of the inference service's span.
                     # Falls back silently to a root span on any error (missing keys, wrong types, etc.)
@@ -290,7 +322,7 @@ def monkey_patch_comfyui():
                         capture_pytorch_memory_snapshot(span, "before")
 
                         try:
-                            result = await original_execute_async(self, prompt, prompt_id, extra_data, execute_outputs)
+                            result = await original_execute_async(self, *args, **kwargs)
                             return result
 
                         except Exception as e:
@@ -313,15 +345,26 @@ def monkey_patch_comfyui():
         # Patch per-node execution
         if NODE_TRACING_ENABLED and hasattr(execution, 'execute'):
             original_execute = execution.execute
+            _ex_sig = inspect.signature(original_execute)
 
             @functools.wraps(original_execute)
-            async def traced_execute(server, dynprompt, caches, current_item, extra_data, executed, prompt_id, execution_list, pending_subgraph_results, pending_async_nodes, ui_outputs):
+            async def traced_execute(*args, **kwargs):
                 """Traced version of per-node execution with memory tracking.
+
+                Uses *args/**kwargs to forward all parameters transparently,
+                making this wrapper resilient to upstream signature changes.
+                Parameters we need are extracted by name via inspect.signature binding.
 
                 Creates a child span under comfyui.workflow.execute for each node,
                 tagged with class_type, node_id, and optional VRAM/RAM snapshots.
                 Cached nodes get a short span tagged with node.cached=true.
                 """
+                # Extract only the parameters we need (position-independent)
+                current_item = _extract_param(_ex_sig, args, kwargs, 'current_item')
+                dynprompt = _extract_param(_ex_sig, args, kwargs, 'dynprompt')
+                caches = _extract_param(_ex_sig, args, kwargs, 'caches')
+                prompt_id = _extract_param(_ex_sig, args, kwargs, 'prompt_id')
+
                 unique_id = current_item
                 try:
                     class_type = dynprompt.get_node(unique_id).get('class_type', 'unknown')
@@ -338,7 +381,7 @@ def monkey_patch_comfyui():
                     span.set_tag('workflow.prompt_id', prompt_id)
 
                     # Check if this node is cached (will return early from original_execute)
-                    is_cached = caches.outputs.get(unique_id) is not None
+                    is_cached = caches.outputs.get(unique_id) is not None if caches else False
                     if is_cached:
                         span.set_tag('node.cached', True)
 
@@ -346,11 +389,7 @@ def monkey_patch_comfyui():
                     capture_node_memory_snapshot(span, "before")
 
                     try:
-                        result = await original_execute(
-                            server, dynprompt, caches, current_item, extra_data,
-                            executed, prompt_id, execution_list,
-                            pending_subgraph_results, pending_async_nodes, ui_outputs,
-                        )
+                        result = await original_execute(*args, **kwargs)
 
                         # Tag the result status
                         if result and len(result) >= 1:

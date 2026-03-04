@@ -377,3 +377,85 @@ class TestNodeTracingConfig:
         with patch.dict(os.environ, {'NODE_MEMORY_TRACKING': 'false'}):
             result = os.getenv('NODE_MEMORY_TRACKING', 'true').lower() != 'false'
             assert result is False
+
+
+class TestExtractParam:
+    """Tests for _extract_param helper used by *args/**kwargs wrappers."""
+
+    @pytest.fixture(autouse=True)
+    def _import_mod(self):
+        """Import __init__ module with execution mock to prevent monkey_patch side effects."""
+        import sys
+        mock_execution = MagicMock()
+        with patch.dict(sys.modules, {'execution': mock_execution}):
+            if '__init__' in sys.modules:
+                import importlib
+                self.mod = importlib.reload(sys.modules['__init__'])
+            else:
+                import __init__ as mod
+                self.mod = mod
+            yield
+
+    def test_extracts_positional_arg_by_name(self):
+        """Can extract a positional argument using its parameter name."""
+        import inspect
+        def fn(a, b, c): pass
+        sig = inspect.signature(fn)
+        result = self.mod._extract_param(sig, (10, 20, 30), {}, 'b')
+        assert result == 20
+
+    def test_extracts_keyword_arg(self):
+        """Can extract a keyword argument."""
+        import inspect
+        def fn(a, b, c=99): pass
+        sig = inspect.signature(fn)
+        result = self.mod._extract_param(sig, (1,), {'b': 42}, 'b')
+        assert result == 42
+
+    def test_extracts_default_value(self):
+        """Returns the function's default when arg not provided."""
+        import inspect
+        def fn(a, b, c=99): pass
+        sig = inspect.signature(fn)
+        result = self.mod._extract_param(sig, (1, 2), {}, 'c')
+        assert result == 99
+
+    def test_returns_fallback_for_missing_param(self):
+        """Returns caller's default when the parameter doesn't exist in the signature."""
+        import inspect
+        def fn(a, b): pass
+        sig = inspect.signature(fn)
+        result = self.mod._extract_param(sig, (1, 2), {}, 'nonexistent', 'fallback')
+        assert result == 'fallback'
+
+    def test_returns_default_on_signature_mismatch(self):
+        """Returns default when args don't match the signature (e.g. upstream added required params)."""
+        import inspect
+        def fn(a, b, c): pass  # 3 required params
+        sig = inspect.signature(fn)
+        # Only pass 1 arg — sig.bind will raise TypeError
+        result = self.mod._extract_param(sig, (1,), {}, 'b', 'safe_default')
+        assert result == 'safe_default'
+
+    def test_works_with_kwargs_style_forwarding(self):
+        """Simulates the *args/**kwargs forwarding pattern used in the wrappers."""
+        import inspect
+        def original(self, prompt, prompt_id, extra_data=None): pass
+        sig = inspect.signature(original)
+        # Simulate: traced_fn(self, *args, **kwargs) called as traced_fn(obj, 'p', 'pid', extra_data={'k': 'v'})
+        self_obj = object()
+        args = (self_obj, 'my_prompt', 'prompt-123')
+        kwargs = {'extra_data': {'dd_trace_id': '999'}}
+        assert self.mod._extract_param(sig, args, kwargs, 'prompt_id') == 'prompt-123'
+        assert self.mod._extract_param(sig, args, kwargs, 'extra_data') == {'dd_trace_id': '999'}
+
+    def test_new_params_dont_break_extraction(self):
+        """If upstream adds new params, existing extraction still works as long as args align."""
+        import inspect
+        # Simulate: upstream added 'new_param' at the end
+        def original_v2(server, dynprompt, caches, current_item, prompt_id, new_param=None): pass
+        sig = inspect.signature(original_v2)
+        args = ('srv', 'dp', 'cch', 'item_42', 'pid_abc', 'new_val')
+        assert self.mod._extract_param(sig, args, {}, 'current_item') == 'item_42'
+        assert self.mod._extract_param(sig, args, {}, 'prompt_id') == 'pid_abc'
+        assert self.mod._extract_param(sig, args, {}, 'new_param') == 'new_val'
