@@ -1,12 +1,14 @@
 """
 ComfyUI Datadog Monitor
 Adds Datadog APM tracing and CUDA memory tracking to ComfyUI workflow execution.
+Includes per-node tracing spans with class_type and optional memory metrics.
 Controlled via environment variables (see README).
 """
 
 import os
 import functools
 import logging
+
 
 # Enable CPU profiling by default (sampling-based, ~2% overhead, no GPU impact).
 # Can be disabled with DD_PROFILING_ENABLED=false if needed.
@@ -31,8 +33,19 @@ except ImportError:
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-# PyTorch Memory Tracking Configuration
+# PyTorch Memory Tracking Configuration (workflow-level, expensive — opt-in)
 PYTORCH_MEMORY_TRACKING_ENABLED = os.getenv('PYTORCH_MEMORY_TRACKING', '').lower() == 'true'
+
+# Per-node tracing — enabled by default when ddtrace is available.
+# Creates a child span for each node execution under the workflow span.
+# Disable with NODE_TRACING_ENABLED=false if the extra spans are unwanted.
+NODE_TRACING_ENABLED = os.getenv('NODE_TRACING_ENABLED', 'true').lower() != 'false'
+
+# Per-node memory capture — cheap VRAM/RAM snapshots on every node span.
+# Enabled by default. Uses torch.cuda.memory_allocated() (~0.1ms) and
+# psutil.virtual_memory() (~0.1ms), NOT the expensive memory_stats() call.
+# Disable with NODE_MEMORY_TRACKING=false if even the minimal overhead is unwanted.
+NODE_MEMORY_TRACKING_ENABLED = os.getenv('NODE_MEMORY_TRACKING', 'true').lower() != 'false'
 
 if PYTORCH_MEMORY_TRACKING_ENABLED:
     print("🧠 PyTorch memory tracking enabled")
@@ -84,6 +97,35 @@ def capture_pytorch_memory_snapshot(span, stage=""):
 
     except Exception as e:
         logger.error(f"Could not capture PyTorch memory snapshot: {e}")
+
+def capture_node_memory_snapshot(span, stage):
+    """Capture cheap VRAM/RAM metrics for a per-node span.
+
+    Uses only lightweight calls (~0.1ms each):
+    - torch.cuda.memory_allocated() / memory_reserved() — no GPU sync required
+    - psutil.virtual_memory().available — kernel-level, very fast
+
+    Does NOT call the expensive torch.cuda.memory_stats() or memory._snapshot().
+    """
+    if not NODE_MEMORY_TRACKING_ENABLED:
+        return
+
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            span.set_metric(f'memory.vram_allocated_bytes.{stage}', torch.cuda.memory_allocated())
+            span.set_metric(f'memory.vram_reserved_bytes.{stage}', torch.cuda.memory_reserved())
+        elif torch.backends.mps.is_available():
+            span.set_metric(f'memory.mps_allocated_bytes.{stage}', torch.mps.current_allocated_memory())
+    except Exception:
+        pass  # torch not available or no GPU — skip silently
+
+    try:
+        import psutil
+        span.set_metric(f'memory.ram_available_bytes.{stage}', psutil.virtual_memory().available)
+    except Exception:
+        pass
 
 def log_top_memory_allocations(span, prompt_id, stage="after", top_n=5):
     """Extract and log top N CUDA VRAM allocations from PyTorch memory snapshot"""
@@ -188,7 +230,7 @@ def _configure_ddtrace():
         return False
 
 def monkey_patch_comfyui():
-    """Patch ComfyUI workflow execution to add PyTorch memory tracking"""
+    """Patch ComfyUI workflow and node execution to add tracing and memory tracking"""
     global _patched
 
     if _patched:
@@ -203,7 +245,7 @@ def monkey_patch_comfyui():
     try:
         import execution
 
-        print("🔧 Instrumenting ComfyUI for PyTorch memory tracking...")
+        print("🔧 Instrumenting ComfyUI...")
 
         # Patch workflow execution
         if hasattr(execution, 'PromptExecutor'):
@@ -262,13 +304,81 @@ def monkey_patch_comfyui():
                             log_top_memory_allocations(span, prompt_id, stage="after", top_n=5)
 
                 PromptExecutor.execute_async = traced_execute_async
-                print("   ✅ Workflow execution instrumented for PyTorch memory tracking")
+                print("   ✅ Workflow execution instrumented")
             else:
-                print("   ⚠️ PromptExecutor.execute_async not found, skipping instrumentation")
+                print("   ⚠️ PromptExecutor.execute_async not found, skipping workflow instrumentation")
         else:
-            print("   ⚠️ PromptExecutor not found, skipping instrumentation")
+            print("   ⚠️ PromptExecutor not found, skipping workflow instrumentation")
 
-        print("🎉 ComfyUI PyTorch memory tracking enabled!")
+        # Patch per-node execution
+        if NODE_TRACING_ENABLED and hasattr(execution, 'execute'):
+            original_execute = execution.execute
+
+            @functools.wraps(original_execute)
+            async def traced_execute(server, dynprompt, caches, current_item, extra_data, executed, prompt_id, execution_list, pending_subgraph_results, pending_async_nodes, ui_outputs):
+                """Traced version of per-node execution with memory tracking.
+
+                Creates a child span under comfyui.workflow.execute for each node,
+                tagged with class_type, node_id, and optional VRAM/RAM snapshots.
+                Cached nodes get a short span tagged with node.cached=true.
+                """
+                unique_id = current_item
+                try:
+                    class_type = dynprompt.get_node(unique_id).get('class_type', 'unknown')
+                except Exception:
+                    class_type = 'unknown'
+
+                with tracer.trace(
+                    "comfyui.node.execute",
+                    service="comfyui",
+                    resource=class_type,
+                ) as span:
+                    span.set_tag('node.id', str(unique_id))
+                    span.set_tag('node.class_type', class_type)
+                    span.set_tag('workflow.prompt_id', prompt_id)
+
+                    # Check if this node is cached (will return early from original_execute)
+                    is_cached = caches.outputs.get(unique_id) is not None
+                    if is_cached:
+                        span.set_tag('node.cached', True)
+
+                    # Capture cheap memory snapshot before node execution
+                    capture_node_memory_snapshot(span, "before")
+
+                    try:
+                        result = await original_execute(
+                            server, dynprompt, caches, current_item, extra_data,
+                            executed, prompt_id, execution_list,
+                            pending_subgraph_results, pending_async_nodes, ui_outputs,
+                        )
+
+                        # Tag the result status
+                        if result and len(result) >= 1:
+                            span.set_tag('node.result', result[0].name if hasattr(result[0], 'name') else str(result[0]))
+                            if hasattr(result[0], 'name') and result[0].name == 'FAILURE':
+                                span.set_tag('error', True)
+
+                        return result
+
+                    except Exception as e:
+                        span.set_tag('error', True)
+                        span.set_tag('error.type', type(e).__name__)
+                        span.set_tag('error.message', str(e)[:500])
+                        raise
+
+                    finally:
+                        # Capture cheap memory snapshot after node execution
+                        capture_node_memory_snapshot(span, "after")
+
+            execution.execute = traced_execute
+            mem_status = "with memory tracking" if NODE_MEMORY_TRACKING_ENABLED else "without memory tracking"
+            print(f"   ✅ Per-node execution instrumented ({mem_status})")
+        elif not NODE_TRACING_ENABLED:
+            print("   ℹ️ Per-node tracing disabled (NODE_TRACING_ENABLED=false)")
+        else:
+            print("   ⚠️ execution.execute not found, skipping per-node instrumentation")
+
+        print("🎉 ComfyUI instrumentation complete!")
 
     except ImportError as e:
         logger.warning(f"Could not import execution module: {e}")
